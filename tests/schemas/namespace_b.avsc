@@ -1,0 +1,11 @@
+{
+    "type": "record",
+    "name": "TypeB",
+    "namespace": "com.example.b",
+    "fields": [
+        {
+            "name": "ref_to_a",
+            "type": "com.example.a.TypeA"
+        }
+    ]
+}

@@ -3,6 +3,7 @@ use std::fs;
 use std::io::prelude::*;
 
 use apache_avro::schema::{ArraySchema, DecimalSchema, MapSchema, Name, RecordField, RecordSchema};
+use heck::ToSnakeCase;
 
 use crate::Schema;
 use crate::error::{Error, Result};
@@ -93,57 +94,141 @@ impl Generator {
             gs = gs.with_field_overrides(deps, &self.templater.field_overrides)?;
         }
 
-        while let Some(s) = deps.pop() {
-            match s {
-                // Simply generate code
-                Schema::Fixed { .. } => {
-                    let code = &self.templater.str_fixed(&s)?;
-                    output.write_all(code.as_bytes())?
-                }
-                Schema::Enum { .. } => {
-                    let code = &self.templater.str_enum(&s)?;
-                    output.write_all(code.as_bytes())?
-                }
+        // Group schemas by namespace
+        let mut schemas_by_namespace: HashMap<Option<String>, Vec<Schema>> = HashMap::new();
 
-                // Generate code with potentially nested types
-                Schema::Record { .. } => {
-                    let code = &self.templater.str_record(&s, &gs)?;
-                    output.write_all(code.as_bytes())?
-                }
+        for s in deps.iter() {
+            let namespace = s.name().and_then(|n| n.namespace.clone());
+            schemas_by_namespace
+                .entry(namespace)
+                .or_default()
+                .push(s.clone());
+        }
 
-                // Register inner type for it to be used as a nested type later
-                Schema::Array(ArraySchema {
-                    items: ref inner, ..
-                }) => {
-                    let type_str = array_type(inner, &gs)?;
-                    gs.put_type(&s, type_str)
-                }
-                Schema::Map(MapSchema {
-                    types: ref inner, ..
-                }) => {
-                    let type_str = map_type(inner, &gs)?;
-                    gs.put_type(&s, type_str)
-                }
+        // Count unique namespaces (excluding None)
+        let unique_namespaces: Vec<_> = schemas_by_namespace
+            .keys()
+            .filter(|k| k.is_some())
+            .collect();
 
-                Schema::Union(ref union) => {
-                    // Generate custom enum with potentially nested types
-                    if (union.is_nullable() && union.variants().len() > 2)
-                        || (!union.is_nullable() && !union.variants().is_empty())
-                    {
-                        let code = &self.templater.str_union_enum(&s, &gs)?;
-                        output.write_all(code.as_bytes())?
+        // Only use namespace modules if there are multiple different namespaces
+        let use_namespace_modules = unique_namespaces.len() > 1;
+
+        if use_namespace_modules {
+            // Process schemas without namespace first (at the root level)
+            // Iterate in reverse since deps has dependencies LAST
+            if let Some(root_schemas) = schemas_by_namespace.get(&None) {
+                for s in root_schemas.iter().rev() {
+                    self.gen_schema(&s, &mut gs, output)?;
+                }
+            }
+
+            // Process schemas with namespaces (wrapped in modules)
+            let mut namespaces = unique_namespaces;
+            namespaces.sort();
+
+            for (idx, namespace) in namespaces.iter().enumerate() {
+                if let Some(ns) = namespace {
+                    let module_name = namespace_to_module(ns);
+                    // Only add newline before module if it's not the first one
+                    if idx > 0 || schemas_by_namespace.get(&None).is_some() {
+                        writeln!(output, "\npub mod {} {{", module_name)?;
+                    } else {
+                        writeln!(output, "pub mod {} {{", module_name)?;
                     }
 
-                    // Register inner union for it to be used as a nested type later
-                    let type_str = union_type(union, &gs, true)?;
-                    gs.put_type(&s, type_str)
-                }
+                    // Set current namespace in GenState
+                    gs.current_namespace = Some(ns.clone());
 
-                _ => return Err(Error::Schema(format!("Not a valid root schema: {s:?}"))),
+                    if let Some(schemas) = schemas_by_namespace.get(namespace) {
+                        // Iterate in reverse since deps has dependencies LAST
+                        for s in schemas.iter().rev() {
+                            self.gen_schema(s, &mut gs, output)?;
+                        }
+                    }
+
+                    writeln!(output, "}}")?;
+                }
+            }
+        } else {
+            // Generate all schemas in dependency order at root level
+            // (dependencies first, then dependents that use them)
+            // The deps vector has dependencies LAST, so iterate in reverse
+            for s in deps.iter().rev() {
+                self.gen_schema(s, &mut gs, output)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Generate code for a single schema
+    fn gen_schema(&self, s: &Schema, gs: &mut GenState, output: &mut impl Write) -> Result<()> {
+        match s {
+            // Simply generate code
+            Schema::Fixed { .. } => {
+                let code = &self.templater.str_fixed(s)?;
+                output.write_all(code.as_bytes())?
+            }
+            Schema::Enum { .. } => {
+                let code = &self.templater.str_enum(s)?;
+                output.write_all(code.as_bytes())?
+            }
+
+            // Generate code with potentially nested types
+            Schema::Record { .. } => {
+                let code = &self.templater.str_record(s, gs)?;
+                output.write_all(code.as_bytes())?
+            }
+
+            // Register inner type for it to be used as a nested type later
+            Schema::Array(ArraySchema { items: inner, .. }) => {
+                let type_str = array_type(inner, gs)?;
+                gs.put_type(s, type_str)
+            }
+            Schema::Map(MapSchema { types: inner, .. }) => {
+                let type_str = map_type(inner, gs)?;
+                gs.put_type(s, type_str)
+            }
+
+            Schema::Union(union) => {
+                // Generate custom enum with potentially nested types
+                if (union.is_nullable() && union.variants().len() > 2)
+                    || (!union.is_nullable() && !union.variants().is_empty())
+                {
+                    let code = &self.templater.str_union_enum(s, gs)?;
+                    output.write_all(code.as_bytes())?
+                }
+
+                // Register inner union for it to be used as a nested type later
+                let type_str = union_type(union, gs, true)?;
+                gs.put_type(s, type_str)
+            }
+
+            _ => return Err(Error::Schema(format!("Not a valid root schema: {s:?}"))),
+        }
+        Ok(())
+    }
+}
+
+/// Convert an Avro namespace string to a Rust module name.
+/// For example: "com.example.a" -> "com_example_a"
+fn namespace_to_module(namespace: &str) -> String {
+    namespace.replace('.', "_").to_snake_case()
+}
+
+/// Calculate relative path from one namespace to another.
+/// Returns a path like "super::super::target_module" for cross-namespace references.
+pub(crate) fn relative_namespace_path(
+    from_namespace: Option<&str>,
+    to_namespace: Option<&str>,
+) -> Option<String> {
+    match (from_namespace, to_namespace) {
+        (None, None) => None,
+        (None, Some(to)) => Some(namespace_to_module(to)),
+        (Some(_), None) => Some("super".to_string()),
+        (Some(from), Some(to)) if from == to => None,
+        (Some(_), Some(to)) => Some(format!("super::{}", namespace_to_module(to))),
     }
 }
 
@@ -171,6 +256,25 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
         }
         deps.push(s);
     }
+
+    // Track the initial size to know which schemas were pre-existing
+    let initial_deps_count = deps.len();
+
+    // When we encounter a Schema::Ref that points to a schema that existed BEFORE
+    // this deps_stack call (i.e., from a previous schema file), we need to move it
+    // to the end to ensure correct dependency ordering. We don't move schemas that
+    // were discovered during the current traversal (circular dependencies).
+    let handle_ref = |deps: &mut Vec<Schema>, name: &apache_avro::schema::Name| {
+        if let Some(pos) = deps.iter().position(|d| {
+            d.name().map(|n| &n.name) == Some(&name.name)
+        }) {
+            // Only move if it was in the initial deps (from a previous schema file)
+            if pos < initial_deps_count {
+                let referenced = deps.remove(pos);
+                deps.push(referenced);
+            }
+        }
+    };
 
     let mut q = VecDeque::new();
 
@@ -203,6 +307,9 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
                         Schema::Fixed { .. } => push_unique(&mut deps, sr.clone()),
                         Schema::Enum { .. } => push_unique(&mut deps, sr.clone()),
 
+                        // Handle schema references from previous schema files
+                        Schema::Ref { name } => handle_ref(&mut deps, name),
+
                         // Push to the exploration queue for further checks
                         Schema::Record { .. } => q.push_back(sr),
 
@@ -218,6 +325,7 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
                                 q.push_back(sc);
                                 push_unique(&mut deps, s.clone());
                             }
+                            Schema::Ref { name } => handle_ref(&mut deps, name),
                             _ => (),
                         },
                         Schema::Union(union) => {
@@ -237,7 +345,7 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
                                     q.push_back(sc);
                                     push_unique(&mut deps, sc.clone());
                                 }
-
+                                Schema::Ref { name } => handle_ref(&mut deps, name),
                                 _ => (),
                             });
                         }
@@ -260,6 +368,10 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
                     q.push_back(sc.as_ref());
                     push_unique(&mut deps, s.clone());
                 }
+                Schema::Ref { name } => {
+                    handle_ref(&mut deps, name);
+                    push_unique(&mut deps, s.clone());
+                }
                 // ... Not nested, can be pushed to the result stack
                 _ => push_unique(&mut deps, s.clone()),
             },
@@ -280,6 +392,10 @@ fn deps_stack(schema: &Schema, mut deps: Vec<Schema>) -> Vec<Schema> {
                     | Schema::Array(..)
                     | Schema::Union(..) => {
                         q.push_back(sc);
+                        push_unique(&mut deps, s.clone());
+                    }
+                    Schema::Ref { name } => {
+                        handle_ref(&mut deps, name);
                         push_unique(&mut deps, s.clone());
                     }
                     // ... Not nested, can be pushed to the result stack
@@ -581,13 +697,13 @@ mod tests {
 
         let expected = r#"
 #[derive(Debug, PartialEq, Clone, serde::Deserialize, serde::Serialize)]
-pub struct B {
-    pub field_one: A,
+pub struct A {
+    pub field_one: f32,
 }
 
 #[derive(Debug, PartialEq, Clone, serde::Deserialize, serde::Serialize)]
-pub struct A {
-    pub field_one: f32,
+pub struct B {
+    pub field_one: A,
 }
 "#;
 
@@ -604,5 +720,46 @@ pub struct A {
         drop(schema_b_file);
         dir.close()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_relative_namespace_path() {
+        // Sibling namespaces
+        assert_eq!(
+            relative_namespace_path(Some("com.example.a"), Some("com.example.b")),
+            Some("super::com_example_b".to_string())
+        );
+
+        // Sibling namespaces (same parent)
+        assert_eq!(
+            relative_namespace_path(Some("a.b"), Some("a.c")),
+            Some("super::a_c".to_string())
+        );
+
+        // Parent to child (flattened)
+        // This should return super::com_example_b because com_example and com_example_b are siblings
+        assert_eq!(
+            relative_namespace_path(Some("com.example"), Some("com.example.b")),
+            Some("super::com_example_b".to_string())
+        );
+
+        // Child to parent (flattened)
+        // This should return super::com_example because com_example_b and com_example are siblings
+        assert_eq!(
+            relative_namespace_path(Some("com.example.b"), Some("com.example")),
+            Some("super::com_example".to_string())
+        );
+
+        // Root to namespace
+        assert_eq!(
+            relative_namespace_path(None, Some("com.example")),
+            Some("com_example".to_string())
+        );
+
+        // Namespace to root
+        assert_eq!(
+            relative_namespace_path(Some("com.example"), None),
+            Some("super".to_string())
+        );
     }
 }

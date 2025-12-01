@@ -344,6 +344,7 @@ pub struct GenState {
     schemata_by_name: HashMap<Name, Schema>,
     not_eq: HashSet<String>,
     use_chrono_dates: bool,
+    pub current_namespace: Option<String>,
 }
 
 impl GenState {
@@ -363,6 +364,7 @@ impl GenState {
             schemata_by_name,
             not_eq,
             use_chrono_dates: false,
+            current_namespace: None,
         })
     }
 
@@ -958,12 +960,42 @@ impl Templater {
                     },
 
                     Schema::Record(RecordSchema {
-                        name: Name { name: r_name, .. },
+                        name:
+                            Name {
+                                name: r_name,
+                                namespace: r_namespace,
+                                ..
+                            },
                         ..
                     }) => {
                         let r_name = sanitize(r_name.to_upper_camel_case());
                         f.push(name_std.clone());
-                        t.insert(name_std.clone(), r_name.clone());
+
+                        // Check if we need to use a namespace-qualified path
+                        // Only add namespace prefixes when we're inside a namespace module (current_namespace is Some)
+                        let type_name = if let Some(ref current_ns) = gen_state.current_namespace {
+                            if r_namespace.as_ref() != Some(current_ns) {
+                                // Different namespace - need to use relative path
+                                use crate::generator::relative_namespace_path;
+                                if let Some(path) = relative_namespace_path(
+                                    Some(current_ns),
+                                    r_namespace.as_deref(),
+                                ) {
+                                    format!("{}::{}", path, r_name)
+                                } else {
+                                    r_name.clone()
+                                }
+                            } else {
+                                // Same namespace - just use the type name
+                                r_name.clone()
+                            }
+                        } else {
+                            // No current namespace means we're not using namespace modules
+                            // Just use the plain type name
+                            r_name.clone()
+                        };
+
+                        t.insert(name_std.clone(), type_name);
                         if let Some(default) = default {
                             let default = self.parse_default(schema, gen_state, default)?;
                             d.insert(name_std.clone(), default);

@@ -329,3 +329,14 @@ fn gen_two_extra_derives() {
             .unwrap(),
     );
 }
+
+#[test]
+fn gen_namespaces() {
+    let schemas = "tests/schemas/namespace_*.avsc";
+    let src = Source::GlobPattern(schemas);
+    let mut buf = vec![];
+    Generator::new().unwrap().generate(&src, &mut buf).unwrap();
+    let generated = String::from_utf8(buf).unwrap();
+    let expected = std::fs::read_to_string("tests/schemas/namespaces.rs").unwrap();
+    validate(expected, generated)
+}
